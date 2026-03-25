@@ -81,7 +81,6 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.3))
-    use_mixed_quant = bool(int(os.environ.get("USE_MIXED_QUANT", "1")))
 
 # -----------------------------
 # MUON OPTIMIZER
@@ -329,12 +328,13 @@ def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
     q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -127, 127).to(torch.int8).contiguous()
     return q, scale
 
-def mixed_quantize(state_dict: dict[str, Tensor], use_mixed: bool = True) -> tuple[dict[str, Tensor], dict[str, object]]:
-    """Quantization: mixed int5-MLP/int6-attn/int8-other, or uniform int8."""
+def mixed_quantize(state_dict: dict[str, Tensor]) -> tuple[dict[str, Tensor], dict[str, object]]:
+    """Mixed int5-MLP / int6-attn / int8-other quantization."""
     result: dict[str, Tensor] = {}
     meta: dict[str, object] = {}
     for name, tensor in state_dict.items():
         t = tensor.detach().cpu().contiguous()
+        cat = _classify_param(name)
         if not t.is_floating_point() or t.numel() <= 8192:
             result[name] = t.to(torch.float16) if t.is_floating_point() else t
             meta[name] = "passthrough"
@@ -343,24 +343,21 @@ def mixed_quantize(state_dict: dict[str, Tensor], use_mixed: bool = True) -> tup
             result[name] = t.float()
             meta[name] = "passthrough_ctrl"
             continue
-        if use_mixed:
-            cat = _classify_param(name)
-            if cat == "mlp" and t.ndim >= 1:
-                q, s = quantize_intN_per_row(t, clip_range=15)  # int5
-                result[name + ".q"] = q
-                result[name + ".scale"] = s
-                meta[name] = {"type": "int5"}
-                continue
-            elif cat == "attn" and t.ndim >= 1:
-                q, s = quantize_intN_per_row(t, clip_range=31)  # int6
-                result[name + ".q"] = q
-                result[name + ".scale"] = s
-                meta[name] = {"type": "int6"}
-                continue
-        q, s = quantize_float_tensor(t)
-        result[name + ".q"] = q
-        result[name + ".scale"] = s
-        meta[name] = {"type": "int8"}
+        if cat == "mlp" and t.ndim >= 1:
+            q, s = quantize_intN_per_row(t, clip_range=15)  # int5
+            result[name + ".q"] = q
+            result[name + ".scale"] = s
+            meta[name] = {"type": "int5"}
+        elif cat == "attn" and t.ndim >= 1:
+            q, s = quantize_intN_per_row(t, clip_range=31)  # int6
+            result[name + ".q"] = q
+            result[name + ".scale"] = s
+            meta[name] = {"type": "int6"}
+        else:
+            q, s = quantize_float_tensor(t)
+            result[name + ".q"] = q
+            result[name + ".scale"] = s
+            meta[name] = {"type": "int8"}
     return result, meta
 
 def dequantize_mixed(result: dict[str, Tensor], meta: dict[str, object],
@@ -1046,7 +1043,7 @@ def main() -> None:
 
     # Mixed int5/int6 quantization + compression
     sd_cpu = {k: v.detach().cpu() for k, v in base_model.state_dict().items()}
-    quant_result, quant_meta = mixed_quantize(sd_cpu, use_mixed=args.use_mixed_quant)
+    quant_result, quant_meta = mixed_quantize(sd_cpu)
     quant_buf = io.BytesIO()
     torch.save({"w": quant_result, "m": quant_meta}, quant_buf)
     quant_raw = quant_buf.getvalue()
@@ -1059,8 +1056,7 @@ def main() -> None:
             f.write(quant_blob)
         quant_file_bytes = os.path.getsize("final_model.int8.ptz")
         code_bytes = len(code.encode("utf-8"))
-        quant_mode = "mixed_int5_int6" if args.use_mixed_quant else "int8"
-        log0(f"Serialized model {quant_mode}+{_COMPRESSOR}: {quant_file_bytes} bytes")
+        log0(f"Serialized model mixed_quant+{_COMPRESSOR}: {quant_file_bytes} bytes")
         log0(f"Total submission size: {quant_file_bytes + code_bytes} bytes")
 
     if distributed:
