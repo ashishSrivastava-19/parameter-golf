@@ -61,8 +61,9 @@ class Hyperparameters:
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
 
-    # DenseFormer + VRL
+    # DenseFormer + VRL + XSA
     vrl: bool = bool(int(os.environ.get("VRL", "1")))
+    xsa_layers: int = int(os.environ.get("XSA_LAYERS", 4))
 
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
@@ -514,6 +515,7 @@ class CausalSelfAttention(nn.Module):
         num_kv_heads: int,
         rope_base: float,
         qk_gain_init: float,
+        use_xsa: bool = False,
         use_vrl: bool = False,
     ):
         super().__init__()
@@ -523,6 +525,7 @@ class CausalSelfAttention(nn.Module):
             raise ValueError("num_heads must be divisible by num_kv_heads")
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
+        self.use_xsa = use_xsa
         self.use_vrl = use_vrl
         self.head_dim = dim // num_heads
         if self.head_dim % 2 != 0:
@@ -536,8 +539,6 @@ class CausalSelfAttention(nn.Module):
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base)
         if use_vrl:
-            # VRL: learnable blend of first-layer V and current V
-            # Init: [0.0, 1.0] -> softmax -> identity (use current V only)
             self.vrl_lambda = nn.Parameter(torch.tensor([0.0, 1.0], dtype=torch.float32))
 
     def forward(self, x: Tensor, v_first: Tensor | None = None) -> tuple[Tensor, Tensor]:
@@ -565,6 +566,12 @@ class CausalSelfAttention(nn.Module):
             is_causal=True,
             enable_gqa=(self.num_kv_heads != self.num_heads),
         )
+        if self.use_xsa:
+            # XSA: project out self-value component from attention output
+            v_expanded = v.repeat_interleave(self.num_heads // self.num_kv_heads, dim=1)
+            dot = (y * v_expanded).sum(dim=-1, keepdim=True)
+            v_norm_sq = (v_expanded * v_expanded).sum(dim=-1, keepdim=True) + 1e-6
+            y = y - (dot / v_norm_sq) * v_expanded
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
         return self.proj(y), v
 
@@ -591,12 +598,13 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
+        use_xsa: bool = False,
         use_vrl: bool = False,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, use_vrl=use_vrl)
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, use_xsa=use_xsa, use_vrl=use_vrl)
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
@@ -625,6 +633,7 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        xsa_layers: int = 4,
         use_vrl: bool = False,
     ):
         super().__init__()
@@ -648,6 +657,7 @@ class GPT(nn.Module):
                     mlp_mult,
                     rope_base,
                     qk_gain_init,
+                    use_xsa=(i >= num_layers - xsa_layers),
                     use_vrl=(use_vrl and i > 0),
                 )
                 for i in range(num_layers)
@@ -830,6 +840,7 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        xsa_layers=args.xsa_layers,
         use_vrl=args.vrl,
     ).to(device).bfloat16()
     for module in base_model.modules():
@@ -844,6 +855,8 @@ def main() -> None:
     vrl_block_ids = [i for i, b in enumerate(base_model.blocks) if b.attn.use_vrl]
     log0(f"denseformer:dwa_params={dwa_params}")
     log0(f"vrl:enabled={args.vrl},layers={vrl_block_ids}")
+    xsa_block_ids = [i for i, b in enumerate(base_model.blocks) if b.attn.use_xsa]
+    log0(f"xsa:layers={args.xsa_layers} blocks={xsa_block_ids}")
 
     # Optimizer split
     block_named_params = list(base_model.blocks.named_parameters())
