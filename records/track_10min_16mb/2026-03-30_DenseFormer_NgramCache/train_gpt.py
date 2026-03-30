@@ -308,17 +308,26 @@ def eval_val_ngram(
     has_leading_space_lut: Tensor,
     is_boundary_token_lut: Tensor,
 ) -> tuple[float, float]:
-    """Single-pass causal n-gram cache eval. Fully legal: builds cache from past tokens only."""
+    """Single-pass causal n-gram cache eval. Fully legal: builds cache from past tokens only.
+    Streams chunk-by-chunk to avoid OOM — only ~128MB of logits in memory at a time."""
     model.eval()
     seq_len = args.train_seq_len
     vocab_size = args.vocab_size
+    eps = 1e-10
+    chunk_size = 256
 
     all_toks = val_tokens.cpu().numpy().astype(np.int32)
     n_seqs = (len(all_toks) - 1) // seq_len
+    flat_toks = all_toks[:n_seqs * seq_len + 1]  # [N_pos + 1], includes targets
 
-    # Phase A: collect all neural logits from GPU in chunks to avoid OOM
-    chunk_size = 32
-    all_logits_list: list[np.ndarray] = []
+    base_bytes_np = base_bytes_lut.cpu().numpy().astype(np.int32)
+    has_space_np = has_leading_space_lut.cpu().numpy()
+    is_boundary_np = is_boundary_token_lut.cpu().numpy()
+
+    cache = NgramCache(vocab_size)
+    total_bits = 0.0
+    total_bytes = 0.0
+
     with torch.no_grad():
         for start in range(0, n_seqs, chunk_size):
             end = min(start + chunk_size, n_seqs)
@@ -328,54 +337,43 @@ def eval_val_ngram(
             ]).to(device)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 logits = model.forward_logits(batch_in)  # [B, T, vocab]
-            all_logits_list.append(logits.float().cpu().numpy().astype(np.float16))
 
-    all_logits_np = np.concatenate(all_logits_list, axis=0)  # [n_seqs, seq_len, vocab]
-    all_logits_flat = all_logits_np.reshape(-1, vocab_size).astype(np.float32)  # [N_pos, vocab]
+            # Vectorized softmax + entropy + alpha for this chunk only (~128MB peak)
+            chunk_logits = logits.float().cpu().numpy()  # [B, T, vocab] float32
+            chunk_logits -= chunk_logits.max(axis=-1, keepdims=True)
+            exp_l = np.exp(chunk_logits)
+            neural_probs = exp_l / exp_l.sum(axis=-1, keepdims=True)  # [B, T, vocab]
+            H = -(neural_probs * np.log2(neural_probs + eps)).sum(axis=-1)  # [B, T]
+            alpha = 0.05 + 0.55 / (1.0 + np.exp(-2.0 * (H - 4.0)))  # [B, T]
 
-    # Phase B: vectorized softmax, entropy, alpha
-    all_logits_flat -= all_logits_flat.max(axis=-1, keepdims=True)
-    exp_l = np.exp(all_logits_flat)
-    neural_probs = exp_l / exp_l.sum(axis=-1, keepdims=True)  # [N_pos, vocab]
-    eps = 1e-10
-    H = -(neural_probs * np.log2(neural_probs + eps)).sum(axis=-1)  # [N_pos]
-    alpha = 0.05 + 0.55 / (1.0 + np.exp(-2.0 * (H - 4.0)))  # [N_pos], entropy-adaptive blend
+            # Sequential cache loop for positions in this chunk
+            b_size = end - start
+            for b in range(b_size):
+                seq_idx = start + b
+                for t in range(seq_len):
+                    pos = seq_idx * seq_len + t
+                    target = int(flat_toks[pos + 1])
+                    ctx_start = max(0, pos + 1 - 6)
+                    context = tuple(flat_toks[ctx_start: pos + 1].tolist())
 
-    # Pre-fetch LUTs as numpy for speed in the sequential loop
-    base_bytes_np = base_bytes_lut.cpu().numpy().astype(np.int32)
-    has_space_np = has_leading_space_lut.cpu().numpy()
-    is_boundary_np = is_boundary_token_lut.cpu().numpy()
+                    p_neural = neural_probs[b, t]
+                    a = float(alpha[b, t])
 
-    # Sequential loop for n-gram cache state (cache must be updated one token at a time)
-    cache = NgramCache(vocab_size)
-    total_bits = 0.0
-    total_bytes = 0.0
-    flat_toks = all_toks[:n_seqs * seq_len + 1]  # [N_pos + 1], includes targets
+                    p_ngram = cache.query(context)
+                    if p_ngram is not None:
+                        p_final = (1.0 - a) * p_neural + a * p_ngram
+                    else:
+                        p_final = p_neural
 
-    for pos in range(n_seqs * seq_len):
-        target = int(flat_toks[pos + 1])
-        ctx_start = max(0, pos + 1 - 6)
-        context = tuple(flat_toks[ctx_start: pos + 1].tolist())
+                    cache.update(context, target)
 
-        p_neural = neural_probs[pos]
-        a = alpha[pos]
-
-        p_ngram = cache.query(context)
-        if p_ngram is not None:
-            p_final = (1.0 - a) * p_neural + a * p_ngram
-        else:
-            p_final = p_neural
-
-        cache.update(context, target)
-
-        # Count bytes: base bytes + leading space if prev token is not a boundary
-        n_bytes = int(base_bytes_np[target])
-        if n_bytes > 0:
-            prev_tok = int(flat_toks[pos])
-            if bool(has_space_np[target]) and not bool(is_boundary_np[prev_tok]):
-                n_bytes += 1
-            total_bits += -math.log2(float(p_final[target]) + eps) * n_bytes
-            total_bytes += n_bytes
+                    n_bytes = int(base_bytes_np[target])
+                    if n_bytes > 0:
+                        prev_tok = int(flat_toks[pos])
+                        if bool(has_space_np[target]) and not bool(is_boundary_np[prev_tok]):
+                            n_bytes += 1
+                        total_bits += -math.log2(float(p_final[target]) + eps) * n_bytes
+                        total_bytes += n_bytes
 
     bpb = total_bits / total_bytes if total_bytes > 0 else float("inf")
     loss = bpb * math.log(2)
