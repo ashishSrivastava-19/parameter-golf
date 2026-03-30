@@ -32,13 +32,14 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 # -----------------------------
 
 class NgramCache:
-    """Single-pass causal n-gram cache, orders 2-7. Bigram stored as numpy matrix for O(1) lookup."""
+    """Single-pass causal n-gram cache, orders 2-7. Bigram stored as numpy matrix for O(1) lookup.
+    Higher orders use sparse dicts (token->count) to avoid OOM from dense vocab-sized arrays."""
     ORDERS = (7, 6, 5, 4, 3, 2)
 
     def __init__(self, vocab_size: int = 1024):
         self.vocab = vocab_size
         self.bigram = np.zeros((vocab_size, vocab_size), dtype=np.float32)  # [prev, next]
-        self.higher: dict[int, dict[tuple[int, ...], np.ndarray]] = {n: {} for n in self.ORDERS if n > 2}
+        self.higher: dict[int, dict[tuple[int, ...], dict[int, float]]] = {n: {} for n in self.ORDERS if n > 2}
 
     def query(self, context: tuple[int, ...]) -> np.ndarray | None:
         """Return probability distribution for context (longest match wins), or None."""
@@ -50,11 +51,15 @@ class NgramCache:
                 if s > 0:
                     return row / s
             else:
-                counts = self.higher[n].get(key)
-                if counts is not None:
-                    s = counts.sum()
+                sparse = self.higher[n].get(key)
+                if sparse is not None:
+                    s = sum(sparse.values())
                     if s > 0:
-                        return counts / s
+                        dist = np.zeros(self.vocab, dtype=np.float32)
+                        for tok, cnt in sparse.items():
+                            dist[tok] = cnt
+                        dist /= s
+                        return dist
         return None
 
     def update(self, context: tuple[int, ...], token: int) -> None:
@@ -65,8 +70,9 @@ class NgramCache:
                 key = context[-(n - 1):]
                 if len(key) == n - 1:
                     if key not in self.higher[n]:
-                        self.higher[n][key] = np.zeros(self.vocab, dtype=np.float32)
-                    self.higher[n][key][token] += 1
+                        self.higher[n][key] = {}
+                    d = self.higher[n][key]
+                    d[token] = d.get(token, 0.0) + 1.0
 
 
 # -----------------------------
@@ -338,11 +344,14 @@ def eval_val_ngram(
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 logits = model.forward_logits(batch_in)  # [B, T, vocab]
 
-            # Vectorized softmax + entropy + alpha for this chunk only (~128MB peak)
+            # Vectorized softmax + entropy + alpha for this chunk only
             chunk_logits = logits.float().cpu().numpy()  # [B, T, vocab] float32
+            del logits
             chunk_logits -= chunk_logits.max(axis=-1, keepdims=True)
             exp_l = np.exp(chunk_logits)
+            del chunk_logits
             neural_probs = exp_l / exp_l.sum(axis=-1, keepdims=True)  # [B, T, vocab]
+            del exp_l
             H = -(neural_probs * np.log2(neural_probs + eps)).sum(axis=-1)  # [B, T]
             alpha = 0.05 + 0.55 / (1.0 + np.exp(-2.0 * (H - 4.0)))  # [B, T]
 
