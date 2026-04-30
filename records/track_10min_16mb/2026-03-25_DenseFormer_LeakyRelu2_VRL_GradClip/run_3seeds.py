@@ -5,10 +5,16 @@ parse final metrics, and update submission.json with seeds / seed_results /
 val_bpb / val_bpb_std.
 
 Usage (from repo root):
+    # Full 3-seed submission run (writes submission.json):
     python3 records/track_10min_16mb/2026-03-25_DenseFormer_LeakyRelu2_VRL_GradClip/run_3seeds.py
+
+    # Single-seed dry run (no submission.json write — for verifying schedule, etc):
+    python3 records/.../run_3seeds.py --once
+    python3 records/.../run_3seeds.py --once --seed 42
 """
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import re
@@ -26,6 +32,9 @@ LOG_DIR = SUBMISSION_DIR / "logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 SUBMISSION_JSON = SUBMISSION_DIR / "submission.json"
 
+# Schedule retuned for 8xH100: at ~71ms/step the 600s cap fits ~8400 steps.
+# Setting ITERATIONS=8300 lets cosine warmdown (last 1200 steps) actually run
+# instead of being cut off mid-peak-LR.
 ENV_OVERRIDES = {
     "DATA_PATH": "./data/datasets/fineweb10B_sp1024/",
     "TOKENIZER_PATH": "./data/tokenizers/fineweb_1024_bpe.model",
@@ -34,6 +43,8 @@ ENV_OVERRIDES = {
     "VRL": "1",
     "XSA_LAYERS": "4",
     "VAL_LOSS_EVERY": "200",
+    "ITERATIONS": "8300",
+    "WARMDOWN_ITERS": "1200",
 }
 
 PAT_FINAL_EXACT = re.compile(
@@ -133,8 +144,37 @@ def parse_log(path: Path) -> dict:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--once",
+        action="store_true",
+        help="Run a single seed for verification. Does NOT touch submission.json.",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Seed to use for --once. Defaults to SEEDS[0] (1337).",
+    )
+    args = parser.parse_args()
+
     if not SCRIPT.exists():
         sys.exit(f"train script not found: {SCRIPT}")
+
+    if args.once:
+        seed = args.seed if args.seed is not None else SEEDS[0]
+        log = run_seed(seed)
+        parsed = parse_log(log)
+        print(f"\n--- Seed {seed} (verification run) ---")
+        print(json.dumps(parsed, indent=2))
+        print(
+            "\nschedule sanity-check: step_stop should be close to ITERATIONS "
+            f"({ENV_OVERRIDES.get('ITERATIONS', '<default>')}).\n"
+            "If it's far below, training was wallclock-capped before warmdown finished — "
+            "lower ITERATIONS further. If it's well above the cap window, raise it.\n"
+            "submission.json was NOT modified."
+        )
+        return
 
     results: dict[str, dict] = {}
     for seed in SEEDS:
